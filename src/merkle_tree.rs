@@ -126,6 +126,38 @@ impl<T: Hasher> MerkleTree<T> {
         Some(utils::collections::to_hex_string(&root))
     }
 
+    /// Returns a leaf value by index.
+    ///
+    /// ## Examples
+    ///
+    /// ```
+    /// # use rs_merkle::{MerkleTree, algorithms::Sha256, Hasher, Error};
+    /// # use std::convert::TryFrom;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let leaves = [
+    ///     Sha256::hash("a".as_bytes()),
+    ///     Sha256::hash("b".as_bytes()),
+    ///     Sha256::hash("c".as_bytes()),
+    /// ];
+    ///
+    /// let merkle_tree = MerkleTree::<Sha256>::from_leaves(&leaves);
+    /// let second_leaf = merkle_tree.leaf(1);
+    ///
+    /// assert_eq!(
+    ///     second_leaf,
+    ///     leaves.get(1)
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn leaf(&self, leaf_index: usize) -> Option<&T::Hash> {
+        self.current_working_tree
+            .layers()
+            .first()?
+            .get(leaf_index)
+            .map(|it| &it.1)
+    }
+
     /// Returns helper nodes required to build a partial tree for the given indices
     /// to be able to extract a root from it. Useful in constructing Merkle proofs
     fn helper_nodes(&self, leaf_indices: &[usize]) -> Vec<T::Hash> {
