@@ -14,7 +14,7 @@ type PartialTreeLayer<H> = Vec<(usize, H)>;
 /// [`MerkleProof`]: crate::MerkleProof
 #[derive(Clone)]
 pub struct PartialTree<T: Hasher> {
-    layers: Vec<Vec<(usize, T::Hash)>>,
+    pub(crate) layers: Vec<Vec<(usize, T::Hash)>>,
 }
 
 impl<T: Hasher> Default for PartialTree<T> {
@@ -33,9 +33,18 @@ impl<T: Hasher> PartialTree<T> {
     /// This is a helper function to build a full tree from a full set of leaves without any
     /// helper indices
     pub fn from_leaves(leaves: &[T::Hash]) -> Result<Self, Error> {
-        let leaf_tuples: Vec<(usize, T::Hash)> = leaves.iter().cloned().enumerate().collect();
+        Self::from_leaves_iter(leaves.iter().copied())
+    }
 
-        Self::build(vec![leaf_tuples], utils::indices::tree_depth(leaves.len()))
+    pub(crate) fn from_leaves_iter(
+        leaves: impl IntoIterator<Item = T::Hash>,
+    ) -> Result<Self, Error> {
+        let leaves = leaves.into_iter();
+        // Leave room for one appended leaf without reallocating the base layer.
+        let mut leaf_tuples = Vec::with_capacity(leaves.size_hint().0.saturating_add(1));
+        leaf_tuples.extend(leaves.enumerate());
+        let depth = utils::indices::tree_depth(leaf_tuples.len());
+        Self::build(vec![leaf_tuples], depth)
     }
 
     pub fn build(partial_layers: Vec<Vec<(usize, T::Hash)>>, depth: usize) -> Result<Self, Error> {
@@ -47,15 +56,13 @@ impl<T: Hasher> PartialTree<T> {
     /// from merkle proof, or if a complete set of leaves provided as a first argument and no
     /// helper indices given, will construct the whole tree.
     fn build_tree(
-        mut partial_layers: Vec<Vec<(usize, T::Hash)>>,
+        partial_layers: Vec<Vec<(usize, T::Hash)>>,
         full_tree_depth: usize,
     ) -> Result<Vec<PartialTreeLayer<T::Hash>>, Error> {
         let mut partial_tree: Vec<Vec<(usize, T::Hash)>> = Vec::new();
         let mut current_layer = Vec::new();
 
-        // Reversing helper nodes, so we can remove one layer starting from 0 each iteration
-        let mut reversed_layers: Vec<Vec<(usize, T::Hash)>> =
-            partial_layers.drain(..).rev().collect();
+        let mut helper_layers = partial_layers.into_iter();
 
         // This iterates to full_tree_depth and not to the partial_layers_len because
         // when constructing
@@ -65,31 +72,37 @@ impl<T: Hasher> PartialTree<T> {
         // in that case going to be lower that the resulting tree depth
         for _ in 0..full_tree_depth {
             // Appending helper nodes to the current known nodes
-            if let Some(mut nodes) = reversed_layers.pop() {
-                current_layer.append(&mut nodes);
-            }
-            current_layer.sort_by(|(a, _), (b, _)| a.cmp(b));
-
-            // Adding partial layer to the tree
-            partial_tree.push(current_layer.clone());
-
-            // This empties `current` layer and prepares it to be reused for the next iteration
-            let (indices, nodes): (Vec<usize>, Vec<T::Hash>) = current_layer.drain(..).unzip();
-            let parent_layer_indices = utils::indices::parent_indices(&indices);
-
-            for (i, parent_node_index) in parent_layer_indices.iter().enumerate() {
-                match nodes.get(i * 2) {
-                    // Populate `current_layer` back for the next iteration
-                    Some(left_node) => current_layer.push((
-                        *parent_node_index,
-                        T::concat_and_hash(left_node, nodes.get(i * 2 + 1)),
-                    )),
-                    None => return Err(Error::not_enough_helper_nodes()),
+            if let Some(mut nodes) = helper_layers.next() {
+                if current_layer.is_empty() {
+                    current_layer = nodes;
+                } else {
+                    current_layer.append(&mut nodes);
                 }
             }
+            current_layer.sort_unstable_by_key(|(index, _)| *index);
+
+            let mut parents = Vec::with_capacity(utils::indices::div_ceil(current_layer.len(), 2));
+            let mut previous_parent = None;
+            for &(index, _) in &current_layer {
+                let parent_index = index / 2;
+                if previous_parent == Some(parent_index) {
+                    continue;
+                }
+                let child_index = parents.len() * 2;
+                let left = &current_layer
+                    .get(child_index)
+                    .ok_or_else(Error::not_enough_helper_nodes)?
+                    .1;
+                let right = current_layer.get(child_index + 1).map(|(_, hash)| hash);
+                parents.push((parent_index, T::concat_and_hash(left, right)));
+                previous_parent = Some(parent_index);
+            }
+
+            partial_tree.push(current_layer);
+            current_layer = parents;
         }
 
-        partial_tree.push(current_layer.clone());
+        partial_tree.push(current_layer);
 
         Ok(partial_tree)
     }
@@ -118,45 +131,27 @@ impl<T: Hasher> PartialTree<T> {
     /// `MerkleTree`, since both partial trees are essentially constructed in place and there's
     /// no need to verify integrity of the result.
     pub fn merge_unverified(&mut self, other: Self) {
-        // Figure out new tree depth after merge
-        let depth_difference = other.layers().len() - self.layers().len();
-        let combined_tree_size = if depth_difference > 0 {
-            other.layers().len()
-        } else {
-            self.layers().len()
-        };
-
-        for layer_index in 0..combined_tree_size {
-            let mut combined_layer: Vec<(usize, T::Hash)> = Vec::new();
-
-            if let Some(self_layer) = self.layers().get(layer_index) {
-                let mut filtered_layer: Vec<(usize, T::Hash)> = self_layer
+        for (layer_index, nodes) in other.layers.into_iter().enumerate() {
+            if let Some(layer) = self.layers.get_mut(layer_index) {
+                if layer.is_empty() {
+                    *layer = nodes;
+                    continue;
+                }
+                let additional = nodes
                     .iter()
-                    .filter(|(node_index, _)| !other.contains(layer_index, *node_index))
-                    .cloned()
-                    .collect();
-
-                combined_layer.append(&mut filtered_layer);
+                    .filter(|(index, _)| layer.binary_search_by_key(index, |(i, _)| *i).is_err())
+                    .count();
+                // Reserve only for new nodes, not for replacements or a doubled layer.
+                layer.reserve_exact(additional);
+                for (index, hash) in nodes {
+                    match layer.binary_search_by_key(&index, |(i, _)| *i) {
+                        Ok(position) => layer[position].1 = hash,
+                        Err(position) => layer.insert(position, (index, hash)),
+                    }
+                }
+            } else {
+                self.layers.push(nodes);
             }
-
-            if let Some(other_layer) = other.layers().get(layer_index) {
-                let mut cloned_other_layer = other_layer.clone();
-                combined_layer.append(&mut cloned_other_layer);
-            }
-
-            combined_layer.sort_by(|(a, _), (b, _)| a.cmp(b));
-            self.upsert_layer(layer_index, combined_layer);
-        }
-    }
-
-    /// Replace layer at a given index with a new layer. Used during tree merge
-    fn upsert_layer(&mut self, layer_index: usize, mut new_layer: Vec<(usize, T::Hash)>) {
-        match self.layers.get_mut(layer_index) {
-            Some(layer) => {
-                layer.clear();
-                layer.append(new_layer.as_mut())
-            }
-            None => self.layers.push(new_layer),
         }
     }
 
@@ -178,5 +173,41 @@ impl<T: Hasher> PartialTree<T> {
     /// Clears all elements in the ree
     pub fn clear(&mut self) {
         self.layers.clear();
+    }
+}
+
+#[cfg(all(test, feature = "sha2"))]
+mod tests {
+    use super::*;
+    use crate::algorithms::Sha256;
+
+    #[test]
+    fn merge_replaces_and_inserts_nodes_without_discarding_deeper_layers() {
+        let mut tree = PartialTree::<Sha256> {
+            layers: vec![
+                vec![(0, [0; 32]), (2, [2; 32]), (4, [4; 32])],
+                vec![(0, [9; 32])],
+            ],
+        };
+        let other = PartialTree::<Sha256> {
+            layers: vec![vec![(1, [1; 32]), (2, [8; 32]), (5, [5; 32])]],
+        };
+        tree.merge_unverified(other);
+        assert_eq!(
+            tree.layers[0],
+            vec![
+                (0, [0; 32]),
+                (1, [1; 32]),
+                (2, [8; 32]),
+                (4, [4; 32]),
+                (5, [5; 32])
+            ]
+        );
+        assert_eq!(tree.layers[1], vec![(0, [9; 32])]);
+        tree.merge_unverified(PartialTree::new());
+        assert_eq!(tree.layers[0].len(), 5);
+        let mut empty = PartialTree::<Sha256>::new();
+        empty.merge_unverified(tree.clone());
+        assert_eq!(empty.layers, tree.layers);
     }
 }

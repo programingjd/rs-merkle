@@ -48,6 +48,23 @@ in a project that requires no-std, disable default features:
 rs_merkle = { version = "1.4", default-features = false }
 ```
 
+## Memory use without rollback
+
+`MerkleTree<Hasher>` keeps commit history by default. When rollback is not needed,
+use `MerkleTree<Hasher, false>` to avoid storing a second copy of the initial tree:
+
+```rust
+use rs_merkle::{algorithms::Sha256, Hasher, MerkleTree};
+
+let leaves = ["a", "b", "c"].into_iter().map(|value| Sha256::hash(value.as_bytes()));
+let mut tree = MerkleTree::<Sha256, false>::from_leaves_iter(leaves);
+tree.insert(Sha256::hash(b"d")).commit();
+```
+
+`from_leaves_iter` accepts hashes directly from an iterator, avoiding a separate
+input vector.
+`rollback()` is only available when history is enabled.
+
 ## Documentation
 
 [Documentation is available on docs.rs](https://docs.rs/rs_merkle/).

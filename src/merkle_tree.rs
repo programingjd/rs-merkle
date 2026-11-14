@@ -9,20 +9,29 @@ use crate::{partial_tree::PartialTree, utils, utils::indices, Hasher, MerkleProo
 /// Advanced features include being able to make transactional changes to a tree with being able to
 /// roll back to any previously committed state of the tree. This scenario is similar to Git and
 /// can be found in databases and file systems.
+///
+/// Set `KEEP_HISTORY` to `false` to avoid retaining rollback history.
+/// [`MerkleTree::rollback`] is only available with history enabled.
+///
+/// ```compile_fail
+/// use rs_merkle::{algorithms::Sha256, MerkleTree};
+/// let mut tree = MerkleTree::<Sha256, false>::new();
+/// tree.rollback();
+/// ```
 #[derive(Clone)]
-pub struct MerkleTree<T: Hasher> {
+pub struct MerkleTree<T: Hasher, const KEEP_HISTORY: bool = true> {
     current_working_tree: PartialTree<T>,
     history: Vec<PartialTree<T>>,
     uncommitted_leaves: Vec<T::Hash>,
 }
 
-impl<T: Hasher> Default for MerkleTree<T> {
+impl<T: Hasher, const KEEP_HISTORY: bool> Default for MerkleTree<T, KEEP_HISTORY> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T: Hasher> MerkleTree<T> {
+impl<T: Hasher, const KEEP_HISTORY: bool> MerkleTree<T, KEEP_HISTORY> {
     /// Creates a new instance of Merkle Tree. Requires a hash algorithm to be specified.
     ///
     /// # Examples
@@ -60,10 +69,27 @@ impl<T: Hasher> MerkleTree<T> {
     /// # Ok(())
     /// # }
     pub fn from_leaves(leaves: &[T::Hash]) -> Self {
-        let mut tree = Self::new();
-        tree.append(leaves.to_vec().as_mut());
-        tree.commit();
-        tree
+        Self::from_leaves_iter(leaves.iter().copied())
+    }
+
+    /// Builds a tree from an iterator, without first collecting a separate leaf vector.
+    /// This is one committed state, just like [`MerkleTree::from_leaves`].
+    pub fn from_leaves_iter(leaves: impl IntoIterator<Item = T::Hash>) -> Self {
+        let current_working_tree = PartialTree::from_leaves_iter(leaves)
+            .expect("a complete set of leaves must form a valid tree");
+        if current_working_tree.root().is_none() {
+            return Self::new();
+        }
+        let history = if KEEP_HISTORY {
+            vec![current_working_tree.clone()]
+        } else {
+            Vec::new()
+        };
+        Self {
+            current_working_tree,
+            history,
+            uncommitted_leaves: Vec::new(),
+        }
     }
 
     /// Returns the tree root - the top hash of the tree. Used in the inclusion proof verification.
@@ -312,7 +338,7 @@ impl<T: Hasher> MerkleTree<T> {
 
     /// Commits the changes made by [`MerkleTree::insert`] and [`MerkleTree::append`]
     /// and modifies the root.
-    /// Commits are saved to the history, so the tree can be rolled back to any previous commit
+    /// With `KEEP_HISTORY = true`, commits are saved so the tree can be rolled back to any previous commit
     /// using [`MerkleTree::rollback`]
     ///
     /// ## Examples
@@ -342,12 +368,16 @@ impl<T: Hasher> MerkleTree<T> {
     /// ```
     pub fn commit(&mut self) {
         if let Some(diff) = self.uncommitted_diff() {
-            self.history.push(diff.clone());
+            if KEEP_HISTORY {
+                self.history.push(diff.clone());
+            }
             self.current_working_tree.merge_unverified(diff);
             self.uncommitted_leaves.clear();
         }
     }
+}
 
+impl<T: Hasher> MerkleTree<T> {
     /// Rolls back one commit and reverts the tree to the previous state.
     /// Removes the most recent commit from the history.
     ///
@@ -391,7 +421,9 @@ impl<T: Hasher> MerkleTree<T> {
             self.current_working_tree.merge_unverified(commit.clone());
         }
     }
+}
 
+impl<T: Hasher, const KEEP_HISTORY: bool> MerkleTree<T, KEEP_HISTORY> {
     /// Calculates the root of the uncommitted changes as if they were committed.
     /// Will return the same hash as [`MerkleTree::root`] after [`MerkleTree::commit`]
     ///
